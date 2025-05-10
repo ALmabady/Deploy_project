@@ -1,6 +1,5 @@
-from fastapi import FastAPI, File, UploadFile, Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from PIL import Image
 import torch
 import torch.nn.functional as F
@@ -8,19 +7,18 @@ import timm
 import torchvision.transforms as transforms
 import io
 import base64
-import numpy as np
 
-# ----- Model Architecture -----
+# ------------------ Model Definition ------------------
+
 class PrototypicalNetwork(torch.nn.Module):
     def __init__(self, embedding_dim=128):
         super(PrototypicalNetwork, self).__init__()
         self.backbone = timm.create_model('deit_small_patch16_224', pretrained=True)
         for param in self.backbone.parameters():
             param.requires_grad = False
-        if hasattr(self.backbone, 'blocks'):
-            for block in self.backbone.blocks[-2:]:
-                for param in block.parameters():
-                    param.requires_grad = True
+        for block in self.backbone.blocks[-2:]:
+            for param in block.parameters():
+                param.requires_grad = True
         self.embedding_layer = torch.nn.Linear(self.backbone.embed_dim, embedding_dim)
 
     def forward(self, x):
@@ -30,20 +28,25 @@ class PrototypicalNetwork(torch.nn.Module):
         embedding = self.embedding_layer(features)
         return F.normalize(embedding, p=2, dim=1)
 
-# Load model and prototypes
+# ------------------ Load Model ------------------
+
 model = PrototypicalNetwork(embedding_dim=128)
 model.load_state_dict(torch.load("model_state.pth", map_location=torch.device("cpu")))
 model.eval()
+
+# ------------------ Load Class Prototypes ------------------
+
 class_prototypes = torch.load("class_prototypes.pth", map_location=torch.device("cpu"))
 
-# Image preprocessing
+# ------------------ Preprocessing & Classes ------------------
+
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
 ])
 
-# Class labels and threshold
 class_names = [
     'Abu Simbel Temple', 'Bibliotheca Alexandrina', 'Nefertari Temple', 
     'Saint Catherine Monastery', 'Citadel of Saladin', 'Monastery of St. Simeon', 
@@ -55,25 +58,29 @@ class_names = [
     'Great Pyramids of Giza', 'Hatshepsut temple', 'Meidum pyramid', 
     'Royal Montaza Palace'
 ]
+
 threshold = 0.35
 
-# Initialize FastAPI
+# ------------------ FastAPI App ------------------
+
 app = FastAPI()
 
-# Base64 input model
-class ImageBase64(BaseModel):
-    image: str
-
 @app.post("/api/predict_base64")
-async def predict_base64(request: ImageBase64):
+async def predict_base64(request: Request):
     try:
-        # Decode base64 string
-        image_data = base64.b64decode(request.image)
-        image = Image.open(io.BytesIO(image_data)).convert("RGB")
+        data = await request.json()
+        base64_str = data.get("image")
+
+        if not base64_str:
+            return JSONResponse(status_code=400, content={"error": "No image data provided."})
+
+        image_bytes = base64.b64decode(base64_str)
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         image_tensor = transform(image).unsqueeze(0)
 
         with torch.no_grad():
             embedding = model(image_tensor)
+
         distances = torch.cdist(embedding, class_prototypes)
         predicted_class_idx = torch.argmin(distances).item()
         predicted_class = class_names[predicted_class_idx]
@@ -81,27 +88,8 @@ async def predict_base64(request: ImageBase64):
 
         if distance > threshold:
             return JSONResponse(content={"prediction": "Uncertain, distance too high"})
+
         return JSONResponse(content={"prediction": predicted_class, "distance": distance})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
 
-# Optional file-upload endpoint
-@app.post("/predict/")
-async def predict(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        image_tensor = transform(image).unsqueeze(0)
-
-        with torch.no_grad():
-            embedding = model(image_tensor)
-        distances = torch.cdist(embedding, class_prototypes)
-        predicted_class_idx = torch.argmin(distances).item()
-        predicted_class = class_names[predicted_class_idx]
-        distance = distances[0, predicted_class_idx].item()
-
-        if distance > threshold:
-            return JSONResponse(content={"prediction": "Uncertain, distance too high"})
-        return JSONResponse(content={"prediction": predicted_class, "distance": distance})
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
