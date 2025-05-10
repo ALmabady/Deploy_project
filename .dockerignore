@@ -1,8 +1,7 @@
-# Ignore everything by default
 *
-
-# Include only the necessary files
 !app.py
 !requirements.txt
 !model_state.pth
 !class_prototypes.pth
+!Procfile
+!Dockerfile
