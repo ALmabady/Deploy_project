@@ -1,6 +1,6 @@
 fastapi==0.110.0
 uvicorn==0.29.0
-Pillow==10.2.0
+Pillow
 torch==1.12.1+cpu
 torchvision==0.13.1+cpu
 timm==0.6.13
