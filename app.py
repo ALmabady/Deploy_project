@@ -1,36 +1,55 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from PIL import Image
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import transforms
+import timm
+import torchvision.transforms as transforms
 import io
+import numpy as np
 
-# ---- Minimal CNN Encoder ----
-class SimpleCNN(nn.Module):
+# ----- Model Architecture -----
+class PrototypicalNetwork(torch.nn.Module):
     def __init__(self, embedding_dim=128):
-        super(SimpleCNN, self).__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, 16, 3, stride=2), nn.ReLU(),
-            nn.Conv2d(16, 32, 3, stride=2), nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1))
-        )
-        self.fc = nn.Linear(32, embedding_dim)
-
+        super(PrototypicalNetwork, self).__init__()
+        # Load the backbone model (DeiT small)
+        self.backbone = timm.create_model('deit_small_patch16_224', pretrained=True)
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        if hasattr(self.backbone, 'blocks'):
+            # Unfreeze the last two blocks
+            for block in self.backbone.blocks[-2:]:
+                for param in block.parameters():
+                    param.requires_grad = True
+        # Embedding layer
+        self.embedding_layer = torch.nn.Linear(self.backbone.embed_dim, embedding_dim)
+    
     def forward(self, x):
-        x = self.conv(x).squeeze()
-        x = self.fc(x)
-        return F.normalize(x, p=2, dim=1)
+        features = self.backbone.forward_features(x)
+        if features.ndim == 3:
+            features = features[:, 0, :]
+        embedding = self.embedding_layer(features)
+        return F.normalize(embedding, p=2, dim=1)
 
-# ---- Load model + prototypes ----
-model = SimpleCNN(embedding_dim=128)
-model.load_state_dict(torch.load("model_state.pth", map_location=torch.device("cpu")))
-model.eval()
+# ----- Load Model and Prototypes -----
+model = PrototypicalNetwork(embedding_dim=128)
+state_dict = torch.load("model_state.pth", map_location=torch.device("cpu"))
+model.load_state_dict(state_dict)
 
+# Load class prototypes
 class_prototypes = torch.load("class_prototypes.pth", map_location=torch.device("cpu"))
 
-# ---- Class labels & threshold ----
+# Set the model to evaluation mode
+model.eval()
+
+# ----- Image Preprocessing Transform -----
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+# ----- Class Names and Threshold -----
 class_names = [
     'Abu Simbel Temple', 'Bibliotheca Alexandrina', 'Nefertari Temple', 
     'Saint Catherine Monastery', 'Citadel of Saladin', 'Monastery of St. Simeon', 
@@ -44,33 +63,39 @@ class_names = [
 ]
 threshold = 0.35
 
-transform = transforms.Compose([
-    transforms.Resize((64, 64)),
-    transforms.ToTensor()
-])
-
-# ---- FastAPI setup ----
+# Initialize FastAPI app
 app = FastAPI()
 
-@app.post("/predict")
+# Endpoint for prediction
+@app.post("/predict/")
 async def predict(file: UploadFile = File(...)):
     try:
+        # Read the file and convert to image
         contents = await file.read()
-        img = Image.open(io.BytesIO(contents)).convert("RGB")
-        img_tensor = transform(img).unsqueeze(0)
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+        
+        # Preprocess the image
+        image_tensor = transform(image).unsqueeze(0)  # Add batch dimension
+
+        # Get image embeddings from the model
         with torch.no_grad():
-            embedding = model(img_tensor)
+            embedding = model(image_tensor)
 
-        distances = {
-            cls: torch.norm(embedding - proto.unsqueeze(0)).item()
-            for cls, proto in class_prototypes.items()
-        }
-        pred_class = min(distances, key=distances.get)
-        min_distance = distances[pred_class]
+        # Calculate the distances to each class prototype
+        distances = torch.cdist(embedding, class_prototypes)
 
-        if min_distance > threshold:
-            return JSONResponse(content={"prediction": "unknown"})
-        return JSONResponse(content={"prediction": class_names[pred_class]})
+        # Get the predicted class (minimum distance)
+        predicted_class_idx = torch.argmin(distances).item()
+
+        # Get the class name
+        predicted_class = class_names[predicted_class_idx]
+
+        # Check if the predicted class is within the threshold
+        distance = distances[0, predicted_class_idx].item()
+        if distance > threshold:
+            return JSONResponse(content={"prediction": "Uncertain, distance too high"})
+        
+        return JSONResponse(content={"prediction": predicted_class, "distance": distance})
 
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(status_code=500, content={"error": str(e)})
