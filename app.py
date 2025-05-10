@@ -1,41 +1,36 @@
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import JSONResponse
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
-from PIL import Image
-import timm
-import base64
 import io
-from flask import Flask, request, jsonify
 
-# ----- Model Definition -----
-class PrototypicalNetwork(nn.Module):
+# ---- Minimal CNN Encoder ----
+class SimpleCNN(nn.Module):
     def __init__(self, embedding_dim=128):
-        super(PrototypicalNetwork, self).__init__()
-        self.backbone = timm.create_model('deit_small_patch16_224', pretrained=True)
-        for param in self.backbone.parameters():
-            param.requires_grad = False
-        if hasattr(self.backbone, 'blocks'):
-            for block in self.backbone.blocks[-2:]:
-                for param in block.parameters():
-                    param.requires_grad = True
-        self.embedding_layer = nn.Linear(self.backbone.embed_dim, embedding_dim)
+        super(SimpleCNN, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 16, 3, stride=2), nn.ReLU(),
+            nn.Conv2d(16, 32, 3, stride=2), nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1))
+        )
+        self.fc = nn.Linear(32, embedding_dim)
 
     def forward(self, x):
-        features = self.backbone.forward_features(x)
-        if features.ndim == 3:
-            features = features[:, 0, :]
-        embedding = self.embedding_layer(features)
-        return F.normalize(embedding, p=2, dim=1)
+        x = self.conv(x).squeeze()
+        x = self.fc(x)
+        return F.normalize(x, p=2, dim=1)
 
-# ----- Load Model & Prototypes -----
-model = PrototypicalNetwork(embedding_dim=128)
-model.load_state_dict(torch.load("model_state.pth", map_location="cpu"))
+# ---- Load model + prototypes ----
+model = SimpleCNN(embedding_dim=128)
+model.load_state_dict(torch.load("model_state.pth", map_location=torch.device("cpu")))
 model.eval()
 
-class_prototypes = torch.load("class_prototypes.pth", map_location="cpu")
+class_prototypes = torch.load("class_prototypes.pth", map_location=torch.device("cpu"))
 
-# ----- Class Labels -----
+# ---- Class labels & threshold ----
 class_names = [
     'Abu Simbel Temple', 'Bibliotheca Alexandrina', 'Nefertari Temple', 
     'Saint Catherine Monastery', 'Citadel of Saladin', 'Monastery of St. Simeon', 
@@ -49,52 +44,33 @@ class_names = [
 ]
 threshold = 0.35
 
-# ----- Image Preprocessing -----
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
+    transforms.Resize((64, 64)),
+    transforms.ToTensor()
 ])
 
-def preprocess_base64_image(base64_str):
-    image_data = base64.b64decode(base64_str)
-    image = Image.open(io.BytesIO(image_data)).convert("RGB")
-    return transform(image).unsqueeze(0)
+# ---- FastAPI setup ----
+app = FastAPI()
 
-# ----- Inference Logic -----
-def predict_image(image_tensor):
-    with torch.no_grad():
-        embedding = model(image_tensor)
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+        img_tensor = transform(img).unsqueeze(0)
+        with torch.no_grad():
+            embedding = model(img_tensor)
+
         distances = {
             cls: torch.norm(embedding - proto.unsqueeze(0)).item()
             for cls, proto in class_prototypes.items()
         }
         pred_class = min(distances, key=distances.get)
-        if distances[pred_class] > threshold:
-            return "unknown"
-        return class_names[pred_class]
+        min_distance = distances[pred_class]
 
-# ----- Flask App -----
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return jsonify({"message": "Fas7ni Tourism Detector API"}), 200
-
-@app.route("/predict_base64", methods=["POST"])
-def predict_base64():
-    try:
-        data = request.get_json()
-        if not data or "image" not in data:
-            return jsonify({"error": "No image provided"}), 400
-
-        image_tensor = preprocess_base64_image(data["image"])
-        prediction = predict_image(image_tensor)
-        return jsonify({"prediction": prediction})
+        if min_distance > threshold:
+            return JSONResponse(content={"prediction": "unknown"})
+        return JSONResponse(content={"prediction": class_names[pred_class]})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
