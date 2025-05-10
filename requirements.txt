@@ -1,4 +1,4 @@
-torch==2.5.1
+torch==2.0.1
 timm==1.0.15
 fastapi==0.75.0
 uvicorn==0.17.0
