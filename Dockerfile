@@ -1,25 +1,17 @@
-# Start with a minimal Python base
 FROM python:3.10-slim
 
-# Set environment variables to reduce cache usage
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# System dependencies
+RUN apt-get update && apt-get install -y libgl1-mesa-glx && rm -rf /var/lib/apt/lists/*
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    libgl1-mesa-glx \
-    && rm -rf /var/lib/apt/lists/*
-
-# Set working directory
+# Set work directory
 WORKDIR /app
 
-# Copy requirements and install with no cache
+# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
+# Copy app
 COPY . .
 
-# Set entrypoint
-CMD ["gunicorn", "--bind", "0.0.0.0:8000", "app:app"]
+# Serve API with uvicorn
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
