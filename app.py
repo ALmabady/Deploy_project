@@ -1,5 +1,6 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Body
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 import torch
 import torch.nn.functional as F
@@ -7,6 +8,7 @@ import timm
 import torchvision.transforms as transforms
 import io
 import numpy as np
+import base64
 
 # ----- Model Architecture -----
 class PrototypicalNetwork(torch.nn.Module):
@@ -35,10 +37,8 @@ class PrototypicalNetwork(torch.nn.Module):
 model = PrototypicalNetwork(embedding_dim=128)
 state_dict = torch.load("model_state.pth", map_location=torch.device("cpu"))
 model.load_state_dict(state_dict)
-
 # Load class prototypes
 class_prototypes = torch.load("class_prototypes.pth", map_location=torch.device("cpu"))
-
 # Set the model to evaluation mode
 model.eval()
 
@@ -64,38 +64,80 @@ class_names = [
 threshold = 0.35
 
 # Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(title="Egyptian Landmarks Classifier API")
 
-# Endpoint for prediction
+# Add CORS middleware to allow cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+def process_image(image):
+    """Process image through the model and return prediction"""
+    # Preprocess the image
+    image_tensor = transform(image).unsqueeze(0)  # Add batch dimension
+    
+    # Get image embeddings from the model
+    with torch.no_grad():
+        embedding = model(image_tensor)
+    
+    # Calculate the distances to each class prototype
+    distances = torch.cdist(embedding, class_prototypes)
+    
+    # Get the predicted class (minimum distance)
+    predicted_class_idx = torch.argmin(distances).item()
+    
+    # Get the class name
+    predicted_class = class_names[predicted_class_idx]
+    
+    # Check if the predicted class is within the threshold
+    distance = distances[0, predicted_class_idx].item()
+    if distance > threshold:
+        return {"prediction": "Uncertain, distance too high"}
+    
+    return {"prediction": predicted_class, "distance": float(distance)}
+
+@app.get("/")
+def root():
+    """Root endpoint to check if API is running"""
+    return {"message": "Egyptian Landmarks Classifier API is running. Use /predict/ or /api/predict_base64 endpoints."}
+
 @app.post("/predict/")
 async def predict(file: UploadFile = File(...)):
+    """Endpoint for prediction using file upload"""
     try:
         # Read the file and convert to image
         contents = await file.read()
         image = Image.open(io.BytesIO(contents)).convert("RGB")
         
-        # Preprocess the image
-        image_tensor = transform(image).unsqueeze(0)  # Add batch dimension
-
-        # Get image embeddings from the model
-        with torch.no_grad():
-            embedding = model(image_tensor)
-
-        # Calculate the distances to each class prototype
-        distances = torch.cdist(embedding, class_prototypes)
-
-        # Get the predicted class (minimum distance)
-        predicted_class_idx = torch.argmin(distances).item()
-
-        # Get the class name
-        predicted_class = class_names[predicted_class_idx]
-
-        # Check if the predicted class is within the threshold
-        distance = distances[0, predicted_class_idx].item()
-        if distance > threshold:
-            return JSONResponse(content={"prediction": "Uncertain, distance too high"})
+        # Process the image
+        result = process_image(image)
         
-        return JSONResponse(content={"prediction": predicted_class, "distance": distance})
+        return JSONResponse(content=result)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
+@app.post("/api/predict_base64")
+async def predict_base64(data: dict = Body(...)):
+    """Endpoint for prediction using base64 encoded image"""
+    try:
+        # Extract the base64 string from the request
+        base64_string = data.get("image", "")
+        if not base64_string:
+            return JSONResponse(status_code=400, content={"error": "No image provided"})
+        
+        # Decode the base64 string to binary
+        image_bytes = base64.b64decode(base64_string)
+        
+        # Convert to image
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        
+        # Process the image
+        result = process_image(image)
+        
+        return JSONResponse(content=result)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
